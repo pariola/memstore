@@ -1,0 +1,19 @@
+services:
+  node1:
+    image: memstore:latest
+    container_name: node1
+    command: ["-node", "one"]
+    ports:
+      - "8081:8080"
+  node2:
+    image: memstore:latest
+    container_name: node2
+    command: ["-node", "two"]
+    ports:
+      - "8082:8080"
+  node3:
+    image: memstore:latest
+    container_name: node3
+    command: ["-node", "three"]
+    ports:
+      - "8083:8080"

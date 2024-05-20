@@ -1,0 +1,22 @@
+{
+  "listen": ":8080",
+  "raft": {
+    "election_timeout": 1000,
+    "broadcast_interval": 50,
+    "max_heartbeat_timeout": 100,
+    "nodes": {
+      "one": {
+        "peers": [":1235", ":1236"],
+        "listen": ":1234"
+      },
+      "two": {
+        "peers": [":1234", ":1236"],
+        "listen": ":1235"
+      },
+      "three": {
+        "peers": [":1234", ":1235"],
+        "listen": ":1236"
+      }
+    }
+  }
+}
