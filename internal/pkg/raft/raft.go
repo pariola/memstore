@@ -1,56 +1,22 @@
 package raft
 
-import "time"
-
-type RequestType int
-
-const (
-	VoteRequest RequestType = iota + 1
-	LogRequest
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"time"
 )
 
-type LogRequestData struct {
-	Id   int
-	Term int
-
-	LastSentLogTerm   int
-	LastSentLogLength int
-
-	Entries []logEntry
-
-	CommitedLength int
-}
-
-type LogResponseData struct {
-	Id         int
-	Term       int
-	AckLength  int
-	Successful bool
-}
-
-type VoteRequestData struct {
-	Id          int
-	Term        int
-	LogLength   int
-	LogLastTerm int
-}
-
-type VoteResponseData struct {
-	Id    int
-	Term  int
-	Given bool
-}
+var logger = slog.Default()
 
 type peer struct {
 	Id      int
 	Address string
-
-	// health info
 }
 
-type logEntry struct {
-	Data int
+type entry struct {
 	Term int
+	Data []byte
 }
 
 type Role int
@@ -62,38 +28,96 @@ const (
 )
 
 type Raft struct {
-	ticker time.Ticker
-
-	nodeId int
-
-	term int
-	role Role
-
-	votedFor      int
-	votesReceived map[int]struct{}
-
-	log []logEntry
+	nodeId int  // node's id
+	term   int  // node's current term
+	role   Role // node's current role
 
 	peers []peer // neigbours, i'm assumming this does not contain current node
 
-	leaderNodeId int
+	log []entry // log
 
-	// -- Used by all
+	votedFor int // who node has voted for in the current term
 
-	// how much entries from the start of the log has been commited i.e delivered to the application
-	commitedLength int
+	votesReceived map[int]struct{} // if node is a CANDIDATE, tracks which peers it received votes from
+
+	commitedLength int // how much entries from the start of the log has been commited i.e delivered to the application
+
+	leaderNodeId int // leaderNodeId is the id of the current leader, defaults to 0
+
+	leaderLastPing time.Time // last time node heard from the leader
+
+	applyFn func([]byte) // function to pass a message to the application
 
 	// -- Used by Leader
 
-	// how much log entries has the follower acknowledge as received
-	followerAckedLogLength map[int]int
+	followerSentLogLength map[int]int // how much log entries has been sent to the follower by the leader
 
-	// how much log entries has been sent to the follower by the leader
-	followerSentLogLength map[int]int
+	followerAckedLogLength map[int]int // how much log entries has the follower acknowledge as received
 
-	apply func(logEntry)
+	//
+
+	config           Configuration
+	shutdownChan     chan struct{}
+	stopElectionChan chan struct{}
 }
 
+type Configuration struct {
+	Address           string
+	ElectionTimeout   time.Duration
+	HeartbeatTimeout  time.Duration
+	BroadcastInterval time.Duration
+}
+
+func New(cfg Configuration) *Raft {
+	r := &Raft{
+		term: 0,
+		role: RoleFollower,
+
+		log: make([]entry, 0),
+
+		followerSentLogLength:  make(map[int]int),
+		followerAckedLogLength: make(map[int]int),
+
+		shutdownChan:     make(chan struct{}),
+		stopElectionChan: make(chan struct{}, 1), // buffered to avoid blocking
+	}
+
+	// start heartbeat timeout
+	go r.heartbeatTimeout()
+
+	// start periodic broadcast
+	go r.periodicBroadcast()
+
+	return r
+}
+
+// heartbeat handles the timeout for the leader to send heartbeats to followers
+func (r *Raft) heartbeatTimeout() {
+	t := time.NewTicker(r.config.HeartbeatTimeout)
+
+	for {
+		select {
+		case <-r.shutdownChan:
+			t.Stop()
+			return
+
+		case <-t.C:
+			// only followers should check for leader heartbeats - helps avoid candidate/leader creating elections
+			if r.role != RoleFollower {
+				continue
+			}
+
+			// check if leader has sent a heartbeat within the timeout
+			if time.Since(r.leaderLastPing) < r.config.HeartbeatTimeout {
+				continue
+			}
+
+			r.startElection()
+		}
+	}
+}
+
+// startElection [ALL]
 func (r *Raft) startElection() {
 	r.term++
 	r.role = RoleCandidate
@@ -104,7 +128,7 @@ func (r *Raft) startElection() {
 		r.nodeId: {},
 	}
 
-	request := &VoteRequestData{
+	request := &VoteRequest{
 		Id:   r.nodeId,
 		Term: r.term,
 
@@ -113,15 +137,45 @@ func (r *Raft) startElection() {
 		LogLastTerm: r.getLogLastTerm(),
 	}
 
+	// start election timer
+	ctx, cancel := context.WithTimeout(context.Background(), r.config.ElectionTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
 	// send vote request to all nodes
 	for _, peer := range r.peers {
-		r.sendToPeer(peer.Id, VoteRequest, request)
+		wg.Add(1)
+		go r.requestPeerVote(&wg, peer, request)
 	}
 
-	// start timer waiting for replies
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// wait
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-r.shutdownChan:
+	case <-r.stopElectionChan:
+	}
 }
 
-func (r *Raft) handleVoteRequest(req VoteRequestData) VoteResponseData {
+// requestPeerVote [CANDIDATE]
+func (r *Raft) requestPeerVote(wg *sync.WaitGroup, peer peer, request *VoteRequest) {
+	defer wg.Done()
+
+	var response VoteResponse
+	r.sendToPeer(peer.Id, request, &response) // send vote request to peer
+	r.handleVoteResponse(response)            // handle response
+}
+
+// handleVoteRequest [FOLLOWER]
+func (r *Raft) handleVoteRequest(req VoteRequest) VoteResponse {
 	if req.Term > r.term { // if candidate term is higher, move foward and become a follower.
 		r.term = req.Term
 		r.role = RoleFollower
@@ -146,14 +200,15 @@ func (r *Raft) handleVoteRequest(req VoteRequestData) VoteResponseData {
 	}
 
 	// reply candidate with vote response
-	return VoteResponseData{
+	return VoteResponse{
 		Id:    r.nodeId,
 		Term:  r.term,
 		Given: voteGiven,
 	}
 }
 
-func (r *Raft) handleVoteResponse(res VoteResponseData) {
+// handleVoteResponse [LEADER]
+func (r *Raft) handleVoteResponse(res VoteResponse) {
 	if res.Term > r.term { // if response term is higher, move foward and become a follower.
 		r.term = res.Term
 		r.role = RoleFollower
@@ -171,9 +226,9 @@ func (r *Raft) handleVoteResponse(res VoteResponseData) {
 
 	r.votesReceived[res.Id] = struct{}{} // add vote
 
-	quorum := (len(r.peers) + 1) / 2 // minimum number of votes required to become leader
+	quorum := r.quorum() // minimum number of votes required to become leader
 
-	// check quorum satisfied?
+	// quorum satisfied?
 	if len(r.votesReceived) < quorum {
 		return
 	}
@@ -182,16 +237,17 @@ func (r *Raft) handleVoteResponse(res VoteResponseData) {
 	r.role = RoleLeader
 	r.leaderNodeId = r.nodeId
 
-	// todo: cancel election timer
+	r.stopElectionChan <- struct{}{} // cancel election timer
 
 	// notify peers
 	for _, peer := range r.peers {
 		r.followerSentLogLength[peer.Id] = len(r.log) // followers most likely already has up-to-date log as the leader
 		r.followerAckedLogLength[peer.Id] = 0
-		r.replicateLogTo(peer.Id)
+		go r.replicateLogTo(peer.Id)
 	}
 }
 
+// replicateLogTo [LEADER]
 func (r *Raft) replicateLogTo(peerNodeId int) {
 	// determine logs that haven't been sent to the peer yet
 	sentLogLength := r.followerSentLogLength[peerNodeId]
@@ -202,20 +258,22 @@ func (r *Raft) replicateLogTo(peerNodeId int) {
 		lastSentLogTerm = r.log[sentLogLength-1].Term
 	}
 
-	data := LogRequestData{
+	request := &LogRequest{
 		Id:                r.nodeId,
 		Term:              r.term,
 		Entries:           entries,
-		LastSentLogLength: sentLogLength,
+		CommitedLength:    r.commitedLength,
 		LastSentLogTerm:   lastSentLogTerm,
-
-		CommitedLength: 0, // todo: wth?
+		LastSentLogLength: sentLogLength,
 	}
 
 	// send
-	r.sendToPeer(peerNodeId, LogRequest, data)
+	var response LogResponse
+	r.sendToPeer(peerNodeId, request, &response) // send log request to peer
+	r.handleLogResponse(response)                // handle response
 }
 
+// quorum [ALL]
 func (r Raft) getLogLastTerm() int {
 	if len(r.log) > 0 {
 		return r.log[len(r.log)-1].Term
@@ -223,52 +281,70 @@ func (r Raft) getLogLastTerm() int {
 	return 0
 }
 
-func (r *Raft) sendToPeer(peerId int, requestType RequestType, data any) {
-	panic("not implemented")
+// quorum [LEADER]
+func (r Raft) quorum() int {
+	return (len(r.peers) + 1) / 2 // minimum number of votes required to do something
 }
 
+// broadcast [ALL]
 func (r *Raft) broadcast(msg []byte) {
 	if r.role != RoleLeader {
-		// todo: redirect/forward to leader
+		// not a leader, redirect to leader
+		// maybe can handle on application-transport level?
+		r.sendToPeer(r.leaderNodeId, &BroadcastRequest{Data: msg}, nil)
 		return
 	}
 
 	// append message to log with the current term
+	r.log = append(r.log, entry{Term: r.term, Data: msg})
 
 	// acknowledge receiving the message on leader
 	r.followerAckedLogLength[r.nodeId] = len(r.log)
 
 	// notify peers
 	for _, peer := range r.peers {
-		r.replicateLogTo(peer.Id)
+		go r.replicateLogTo(peer.Id)
 	}
 }
 
+// periodicBroadcast [LEADER]
+// as a leader periodically replicate logs to followers,
+// - doubles as a heartbeat for the followrs
+// - incase messages get lost during broadcast, they can be re-delivered.
 func (r *Raft) periodicBroadcast() {
-	// as a leader periodically replicate logs to followers,
-	// - doubles as a heartbeat for the followrs
-	// - incase messages get lost during broadcast, they can be re-delivered.
+	t := time.NewTicker(r.config.BroadcastInterval)
 
-	for range r.ticker.C {
-		if r.role != RoleLeader {
-			continue
-		}
+	for {
+		select {
+		case <-r.shutdownChan:
+			t.Stop()
+			return
 
-		// update peers
-		for _, peer := range r.peers {
-			r.replicateLogTo(peer.Id)
+		case <-t.C:
+			// only leader nodes should broadcast
+			if r.role != RoleLeader {
+				continue
+			}
+
+			// update peers
+			for _, peer := range r.peers {
+				go r.replicateLogTo(peer.Id)
+			}
 		}
 	}
 }
 
-func (r *Raft) handleLogRequest(req LogRequestData) LogResponseData {
+// handleLogRequest [FOLLOWER]
+func (r *Raft) handleLogRequest(req LogRequest) LogResponse {
 	if req.Term > r.term { // if from node's term is higher, move foward and become a follower.
 		r.term = req.Term
 		// r.role = RoleFollower ??
 		r.votedFor = 0 // remove exiting vote
 
-		// todo: cancel election timer
+		r.stopElectionChan <- struct{}{} // cancel election timer
 	}
+
+	r.leaderLastPing = time.Now() // update last time follower heard from leader
 
 	if req.Term == r.term { // if both are on same term, accept from node as leader
 		r.role = RoleFollower
@@ -287,7 +363,7 @@ func (r *Raft) handleLogRequest(req LogRequestData) LogResponseData {
 		ackLength = req.LastSentLogLength + len(req.Entries) // acknowledge the new length (prefix+suffix) of logs received from leader
 	}
 
-	return LogResponseData{
+	return LogResponse{
 		Id:         r.nodeId,
 		Term:       r.term,
 		AckLength:  ackLength,
@@ -295,7 +371,8 @@ func (r *Raft) handleLogRequest(req LogRequestData) LogResponseData {
 	}
 }
 
-func (r *Raft) appendLogEntries(req LogRequestData) {
+// appendLogEntries [FOLLOWER]
+func (r *Raft) appendLogEntries(req LogRequest) {
 	if len(req.Entries) > 0 && len(r.log) > req.LastSentLogLength { // there are new entries and follower has more logs than the leader knows about (i.e an overlap - maybe duplicate log request from leader)
 		index := min(len(r.log), req.LastSentLogLength+len(req.Entries)) - 1 // pick the shorter one, basically where the overlap is expected to start from
 
@@ -314,8 +391,68 @@ func (r *Raft) appendLogEntries(req LogRequestData) {
 
 	if req.CommitedLength > r.commitedLength { // leader has commited more messages, we want to do so as well.
 		for i := r.commitedLength; i < req.CommitedLength; i++ {
-			r.apply(r.log[i]) // apply/deliver message to application
+			r.deliver(r.log[i]) // apply/deliver message to application
 		}
 		r.commitedLength = req.CommitedLength // update since we commited the messages as well
 	}
+}
+
+// handleLogResponse [LEADER]
+func (r *Raft) handleLogResponse(res LogResponse) {
+	if res.Term > r.term { // follower is at a higher term, become a follower
+		r.term = res.Term
+		r.role = RoleFollower
+		r.votedFor = 0 // remove exiting vote
+
+		r.stopElectionChan <- struct{}{} // cancel election timer
+		return
+	}
+
+	good := res.Term == r.term && r.role == RoleLeader // on same term and still a leader
+	if !good {
+		return
+	}
+
+	if res.Successful && res.AckLength >= r.followerAckedLogLength[res.Id] { // logs were applied succesfully, update and commit
+		r.followerSentLogLength[res.Id] = res.AckLength
+		r.followerAckedLogLength[res.Id] = res.AckLength
+
+		r.commitLogEntries()
+	} else if r.followerSentLogLength[res.Id] > 0 { // not successful and leader assumes to have sent messages to follower i.e likey there is a gap in messages
+		// try to resend log entries with 1 more message
+		r.followerSentLogLength[res.Id]--
+		r.replicateLogTo(res.Id)
+	}
+}
+
+// commitLogEntries [LEADER]
+func (r *Raft) commitLogEntries() {
+	for r.commitedLength < len(r.log) {
+		var acks int
+
+		// check if all followers have acknoledged the entry at [commitedLength]
+		for _, peer := range r.peers {
+			if r.followerAckedLogLength[peer.Id] > r.commitedLength {
+				acks++
+			}
+		}
+
+		quorum := r.quorum() // minimum number of acks required to commit log entries
+		if acks < quorum {
+			break
+		}
+
+		r.deliver(r.log[r.commitedLength]) // deliver the entry to the application, followers would commit in the next broadcast
+		r.commitedLength++
+	}
+}
+
+// deliver [ALL]
+func (r *Raft) deliver(entry entry) {
+	r.applyFn(entry.Data)
+}
+
+// Shutdown
+func (r *Raft) Shutdown() {
+	close(r.shutdownChan)
 }
